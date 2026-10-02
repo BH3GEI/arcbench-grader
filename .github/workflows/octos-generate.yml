@@ -19,12 +19,16 @@ on:
         type: string
         default: main
         description: "octos-org/octos-arc ref to build the agent bundle from"
+      model:
+        required: false
+        type: string
+        default: glm-5.3-flash
 
 concurrency:
   # Grouped by octos_ref too: runs validating different branches proceed in
   # parallel (GH free tier allows up to 20 concurrent jobs); two runs on the
   # SAME ref still queue, same as before.
-  group: octos-generate-${{ github.event.inputs.octos_ref || 'main' }}
+  group: octos-generate-${{ github.event.inputs.octos_ref || 'main' }}-${{ github.event.inputs.model || 'glm-5.3-flash' }}
   cancel-in-progress: false
 
 jobs:
@@ -113,7 +117,7 @@ jobs:
           {
             printf 'OPENAI_API_KEY=%s\n' "$ZAI_API_KEY"
             printf 'OPENAI_BASE_URL=%s\n' "https://api.z.ai/api/coding/paas/v4"
-            printf 'MODEL=%s\n' "glm-5.3-flash"
+            printf 'MODEL=%s\n' "${{ github.event.inputs.model || 'glm-5.3-flash' }}"
           } > "$ENV_FILE"
           chmod 600 "$ENV_FILE"
           gen_rc=0
