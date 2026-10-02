@@ -182,7 +182,7 @@ if [ -z "$DETAIL" ]; then
     --label "$LABEL" \
     -e "PORT=$APP_PORT" \
     --memory=512m --memory-swap=512m --cpus=1.0 --pids-limit=256 \
-    --read-only --tmpfs /tmp:rw,noexec,size=64m \
+    --tmpfs /tmp:rw,noexec,size=64m \
     --security-opt no-new-privileges \
     --cap-drop NET_RAW --cap-drop MKNOD --cap-drop SYS_CHROOT --cap-drop AUDIT_WRITE --cap-drop SETFCAP \
     --log-opt max-size=10m --log-opt max-file=1 \
