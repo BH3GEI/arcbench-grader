@@ -35,9 +35,15 @@ jobs:
         env:
           INTERNAL_CHECK_KEY: ${{ secrets.INTERNAL_CHECK_KEY }}
           WEB_BASE_URL: https://arcbench-selftest-web.vercel.app
-          CHECK_TASK_ID: demo-todo
-          EXPECTED_PASSED: "5"
-          EXPECTED_TOTAL: "5"
+          # The production task, not demo-todo: demo-todo is deliberately
+          # hidden/disabled for real submitters, and this check should
+          # exercise the actual pipeline participants use.
+          CHECK_TASK_ID: github-stage-1-req-test
+          # No EXPECTED_PASSED/TOTAL: the fixture is a generic buildable app
+          # (test-fixtures/app-todo-good.zip, a todo app — not an attempt at
+          # this task's real requirement), so it won't score well against
+          # stage-1's tests. The check only needs to prove the pipeline runs
+          # end to end; see PASS_STATUSES in selftest_watch.py.
           FIXTURE_ZIP: test-fixtures/app-todo-good.zip
           DEADLINE_S: "600"
           POLL_INTERVAL_S: "20"

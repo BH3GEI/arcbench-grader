@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Synthetic check for the self-test website: submit the known-good
-`demo-todo` fixture through the real submit -> dispatch -> grade -> callback
--> poll pipeline (using the site's internal-checker identity, which never
-touches a participant's daily quota — see actions/README_ACTIONS.md
-"Internal synthetic check" in the public repo) and verify the result lands
-within the time budget and matches the expected score.
+"""Synthetic check for the self-test website: submit a generic buildable
+fixture app through the real submit -> dispatch -> grade -> callback ->
+poll pipeline against the production task (using the site's
+internal-checker identity, which never touches a participant's daily
+quota) and verify the pipeline actually finishes a real run.
+
+This does not check the score: the fixture is not an attempt at the real
+task's requirement, so it isn't expected to pass any of that task's tests.
+PASS_STATUSES below is what decides pass/fail — any status that means the
+build->run->grade pipeline executed for real (whatever the score), as
+opposed to the request never being graded at all (system_error: the
+harness itself failed, e.g. download/build infra broke) or never being
+accepted in the first place (rejected: the dispatch's signature didn't
+authenticate — a configuration problem, not a pipeline one).
 
 Run by .github/workflows/selftest-watch.yml, which opens an issue on
 failure. Exits 1 and writes a reason to both $GITHUB_STEP_SUMMARY and
-$FAILURE_FILE on any failure (wrong score, wrong status, timeout, or a
-non-200 from the site); exits 0 and writes a short summary on success.
+$FAILURE_FILE on any failure (bad status, timeout, or a non-200 from the
+site); exits 0 and writes a short summary on success.
 """
 from __future__ import annotations
 
@@ -21,9 +29,8 @@ import urllib.error
 import urllib.request
 
 WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "https://arcbench-selftest-web.vercel.app").rstrip("/")
-TASK_ID = os.environ.get("CHECK_TASK_ID", "demo-todo")
-EXPECTED_PASSED = int(os.environ.get("EXPECTED_PASSED", "5"))
-EXPECTED_TOTAL = int(os.environ.get("EXPECTED_TOTAL", "5"))
+TASK_ID = os.environ.get("CHECK_TASK_ID", "github-stage-1-req-test")
+PASS_STATUSES = {"passed", "failed"}
 FIXTURE_ZIP = os.environ.get("FIXTURE_ZIP", "test-fixtures/app-todo-good.zip")
 INTERNAL_CHECK_KEY = os.environ.get("INTERNAL_CHECK_KEY", "")
 DEADLINE_S = int(os.environ.get("DEADLINE_S", str(10 * 60)))
@@ -136,18 +143,13 @@ def main() -> None:
     passed = result.get("passed")
     total = result.get("total")
 
-    if status != "passed":
+    if status not in PASS_STATUSES:
         fail(
-            f"网页状态异常：期望 status=passed，实际 status={status}，"
+            f"网页状态异常：期望 status 属于 {sorted(PASS_STATUSES)}，实际 status={status}，"
             f"detail={result.get('detail')!r}，提交 id={submission_id}，耗时 {elapsed:.0f}s"
         )
-    if passed != EXPECTED_PASSED or total != EXPECTED_TOTAL:
-        fail(
-            f"分数不符：期望 {EXPECTED_PASSED}/{EXPECTED_TOTAL}，实际 {passed}/{total}，"
-            f"提交 id={submission_id}，耗时 {elapsed:.0f}s"
-        )
 
-    ok(f"提交 id={submission_id}，{elapsed:.0f}s 内返回 {passed}/{total}，status=passed。")
+    ok(f"提交 id={submission_id}，{elapsed:.0f}s 内完成，status={status}（{passed}/{total}）。")
 
 
 if __name__ == "__main__":
