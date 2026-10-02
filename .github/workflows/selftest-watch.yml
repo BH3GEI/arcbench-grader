@@ -1,0 +1,60 @@
+name: Self-test synthetic check
+
+# Continuously proves the self-test website's real pipeline (submit ->
+# dispatch -> grade -> callback -> poll) still works, by resubmitting a
+# known-good fixture through it every 2 hours and checking the result
+# matches what's expected — see scripts/selftest_watch.py and the public
+# repo's actions/README_ACTIONS.md "Internal synthetic check" for the
+# submission path this uses (a secret-gated internal endpoint that never
+# spends a real participant's daily quota).
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: selftest-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Submit known-good app and wait for the result
+        id: check
+        continue-on-error: true
+        env:
+          INTERNAL_CHECK_KEY: ${{ secrets.INTERNAL_CHECK_KEY }}
+          WEB_BASE_URL: https://arcbench-selftest-web.vercel.app
+          CHECK_TASK_ID: demo-todo
+          EXPECTED_PASSED: "5"
+          EXPECTED_TOTAL: "5"
+          FIXTURE_ZIP: test-fixtures/app-todo-good.zip
+          DEADLINE_S: "600"
+          POLL_INTERVAL_S: "20"
+        run: python3 scripts/selftest_watch.py
+
+      # Only GitHub issues notify the repo owner by email, so a failure
+      # that's otherwise easy to miss (this workflow runs unattended on a
+      # schedule) still reaches a person.
+      - name: Open an issue on failure
+        if: steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Self-test synthetic check failed: $(date -u +'%Y-%m-%d %H:%M UTC')" \
+            --body-file selftest-failure.md
+
+      - name: Fail the job if the check failed
+        if: steps.check.outcome == 'failure'
+        run: exit 1
