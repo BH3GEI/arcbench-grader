@@ -209,6 +209,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tasks"
           openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass env:TASKS_KEY \
             -in tasks.tar.enc | tar xzf - -C "$RUNNER_TEMP/tasks"
+          # Drop macOS metadata files (._*, .DS_Store, __MACOSX) so they are never collected as tests.
+          find "$RUNNER_TEMP/tasks" \( -name '._*' -o -name '.DS_Store' -o -name '__MACOSX' \) -prune -exec rm -rf {} +
           echo "TASKS_DIR=$RUNNER_TEMP/tasks" >> "$GITHUB_ENV"
 
       - name: Grade
