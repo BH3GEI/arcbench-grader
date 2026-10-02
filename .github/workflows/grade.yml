@@ -1,0 +1,303 @@
+name: Grade submission
+
+# Two ways in:
+#  - repository_dispatch (event_type: grade-submission): the self-test
+#    service calls this with a service PAT after its own quota check passes.
+#    client_payload: { submission_id, task_id, download_url, callback_url?,
+#                       submission_timestamp?, submission_signature? }
+#    submission_timestamp/signature: HMAC-SHA256 of "{submission_id}.
+#    {task_id}.{submission_timestamp}" with SELFTEST_DISPATCH_SIGNING_KEY,
+#    taken as proof quota was already checked — see scripts/verify_signature.py.
+#  - workflow_dispatch: manual/testing trigger with the same fields as inputs,
+#    plus visibility_override for exercising the hidden-visibility path
+#    without editing a task's requirements.yaml. Requires write access to
+#    this repo to invoke, same as any workflow_dispatch on GitHub.
+#
+# This repo is public (free Actions minutes). Isolation rules enforced here:
+#  - Real task content (tasks/demo-todo, tasks/demo-todo-hidden,
+#    tasks/github-stage-1-req-test) never sits in the working tree in the
+#    clear. It's committed only as tasks.tar.enc (openssl aes-256-cbc
+#    +pbkdf2) and decrypted into $RUNNER_TEMP for the one job that needs it,
+#    using the TASKS_KEY secret; the decrypted copy is removed once that job
+#    ends (post-job VM teardown would do this anyway — the rm is explicit
+#    defense in depth).
+#  - No step echoes task/test file names or contents; no `set -x`.
+#  - The only artifact ever uploaded is the generated app's own build
+#    (visible to the submitter regardless), never anything from
+#    .gradework/results (build/app/runner logs, the raw Playwright report)
+#    which can contain hidden-test detail. The small, already
+#    visibility-filtered result.json is passed `grade` -> `report` as a job
+#    output instead of an artifact, so nothing test-derived is ever
+#    independently browsable on this public repo.
+#  - Delivery to the submitter is the `report` job's callback POST
+#    (scripts/report_back.py) to the self-test site, never the Actions log.
+
+on:
+  repository_dispatch:
+    types: [grade-submission]
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        required: true
+        type: string
+      task_id:
+        required: true
+        type: string
+      download_url:
+        required: true
+        type: string
+      visibility_override:
+        required: false
+        type: choice
+        options: ["", public, hidden]
+        default: ""
+      submission_timestamp:
+        required: false
+        type: string
+        description: "unix seconds; only needed to test signature rejection"
+      submission_signature:
+        required: false
+        type: string
+        description: "hex HMAC-SHA256; only needed to test signature rejection"
+
+jobs:
+  # Computes a bounded "lane" (hash of submission_id mod GRADE_LANES; kept as
+  # an output for logs only), validates/normalizes every untrusted input,
+  # and verifies the dispatch's HMAC signature. This is the ONLY job that
+  # holds SELFTEST_DISPATCH_SIGNING_KEY, and it never checks out or runs
+  # anything derived from the submission itself (no download, no build,
+  # no decryption of tasks.tar.enc) — so holding that secret here is safe
+  # even though the submission content is fully untrusted at this point.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      submission_id: ${{ steps.in.outputs.submission_id }}
+      task_id: ${{ steps.in.outputs.task_id }}
+      download_url: ${{ steps.in.outputs.download_url }}
+      visibility_override: ${{ steps.in.outputs.visibility_override }}
+      callback_url: ${{ steps.sig.outputs.callback_url }}
+      lane: ${{ steps.in.outputs.lane }}
+      dispatch_status: ${{ steps.sig.outputs.status }}
+      dispatch_detail: ${{ steps.sig.outputs.detail }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Payload fields go through env, never ${{ }} inside the script body,
+      # so a crafted value cannot inject shell or extra $GITHUB_OUTPUT lines.
+      # visibility_override is only honoured for manual workflow_dispatch
+      # runs — a repository_dispatch caller cannot override a task's own
+      # setting.
+      - name: Normalize inputs and compute lane
+        id: in
+        env:
+          IN_SUBMISSION_ID: ${{ github.event.inputs.submission_id || github.event.client_payload.submission_id }}
+          IN_TASK_ID: ${{ github.event.inputs.task_id || github.event.client_payload.task_id }}
+          IN_DOWNLOAD_URL: ${{ github.event.inputs.download_url || github.event.client_payload.download_url }}
+          IN_VISIBILITY_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.visibility_override || '' }}
+          IN_CALLBACK_URL: ${{ github.event.client_payload.callback_url || '' }}
+          IN_SUBMISSION_TIMESTAMP: ${{ github.event.inputs.submission_timestamp || github.event.client_payload.submission_timestamp || '' }}
+          IN_SUBMISSION_SIGNATURE: ${{ github.event.inputs.submission_signature || github.event.client_payload.submission_signature || '' }}
+          GRADE_LANES: "4"
+        run: |
+          set -euo pipefail
+          ok() { [[ "$1" =~ $2 ]] || { echo "invalid $3" >&2; exit 1; }; }
+          ok "$IN_SUBMISSION_ID" '^[A-Za-z0-9_-]{1,64}$' submission_id
+          ok "$IN_TASK_ID" '^[A-Za-z0-9_-]{1,64}$' task_id
+          ok "$IN_DOWNLOAD_URL" '^https://[^[:space:]]+$' download_url
+          ok "$IN_VISIBILITY_OVERRIDE" '^(public|hidden)?$' visibility_override
+          ok "$IN_CALLBACK_URL" '^(https://[^[:space:]]+)?$' callback_url
+          ok "$IN_SUBMISSION_TIMESTAMP" '^[0-9]*$' submission_timestamp
+          ok "$IN_SUBMISSION_SIGNATURE" '^[0-9a-fA-F]*$' submission_signature
+          LANE=$(( $(echo -n "$IN_SUBMISSION_ID" | cksum | cut -d' ' -f1) % GRADE_LANES ))
+          {
+            echo "submission_id=$IN_SUBMISSION_ID"
+            echo "task_id=$IN_TASK_ID"
+            echo "download_url=$IN_DOWNLOAD_URL"
+            echo "visibility_override=$IN_VISIBILITY_OVERRIDE"
+            echo "callback_url=$IN_CALLBACK_URL"
+            echo "submission_timestamp=$IN_SUBMISSION_TIMESTAMP"
+            echo "submission_signature=$IN_SUBMISSION_SIGNATURE"
+            echo "lane=$LANE"
+          } >> "$GITHUB_OUTPUT"
+
+      # Authenticates the dispatch itself — see scripts/verify_signature.py.
+      # An invalid or unauthenticated dispatch means submission_id/task_id/
+      # callback_url are all untrusted too, so callback_url is dropped
+      # (status=rejected below skips the build entirely in the `grade` job
+      # — no secret, no decryption, no build, no callback for a request
+      # that never proved it was the real service).
+      - name: Verify dispatch signature
+        id: sig
+        env:
+          SUBMISSION_ID: ${{ steps.in.outputs.submission_id }}
+          TASK_ID: ${{ steps.in.outputs.task_id }}
+          SUBMISSION_TIMESTAMP: ${{ steps.in.outputs.submission_timestamp }}
+          SUBMISSION_SIGNATURE: ${{ steps.in.outputs.submission_signature }}
+          CALLBACK_URL: ${{ steps.in.outputs.callback_url }}
+          SELFTEST_DISPATCH_SIGNING_KEY: ${{ secrets.SELFTEST_DISPATCH_SIGNING_KEY }}
+        run: |
+          set -uo pipefail
+          # `|| SIG_RC=$?`, not a bare `SIG_RC=$?` on the next line: the
+          # step's shell runs with -e, so a failing command substitution in
+          # a plain assignment aborted the step before status=rejected was
+          # written, failing the whole job instead.
+          SIG_RC=0
+          SIG_ERR="$(python3 scripts/verify_signature.py \
+            --submission-id "$SUBMISSION_ID" --task-id "$TASK_ID" \
+            --timestamp "${SUBMISSION_TIMESTAMP:-0}" --signature "${SUBMISSION_SIGNATURE:-}" 2>&1 >/dev/null)" || SIG_RC=$?
+          if [ "$SIG_RC" -ne 0 ]; then
+            {
+              echo "status=rejected"
+              echo "detail=dispatch rejected: ${SIG_ERR:-invalid signature}"
+              echo "callback_url="
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "status=ok"
+              echo "detail="
+              echo "callback_url=$CALLBACK_URL"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # Builds and runs the submitted app — fully untrusted code. Read-only
+  # GITHUB_TOKEN, and the only secrets it can see are APP_DOWNLOAD_TOKEN
+  # (scoped to read-only access to app zip storage, nothing else) and
+  # TASKS_KEY (decrypts tasks.tar.enc, never written to disk itself). No
+  # CALLBACK_TOKEN, no SELFTEST_DISPATCH_SIGNING_KEY, no write access to
+  # this repo: a container escape here cannot push to the grader repo or
+  # forge a result callback.
+  grade:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result_json_b64: ${{ steps.pack.outputs.result_json_b64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Chromium's sandbox (kept on, see scripts/grade.sh) needs unprivileged
+      # user namespaces, which ubuntu-24.04 restricts via AppArmor. The
+      # runner is a throwaway VM, so this only affects this one job.
+      - name: Allow unprivileged user namespaces for the browser sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # Decrypt tasks.tar.enc into a runner-temp directory, never into the
+      # working tree. Removed by the "Remove decrypted task content" step
+      # below regardless of how the job ends (if: always()); the VM is
+      # thrown away after the job either way, this is defense in depth,
+      # not the only guard.
+      - name: Decrypt task content
+        env:
+          TASKS_KEY: ${{ secrets.TASKS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tasks"
+          openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass env:TASKS_KEY \
+            -in tasks.tar.enc | tar xzf - -C "$RUNNER_TEMP/tasks"
+          echo "TASKS_DIR=$RUNNER_TEMP/tasks" >> "$GITHUB_ENV"
+
+      - name: Grade
+        id: run
+        continue-on-error: true
+        env:
+          SUBMISSION_ID: ${{ needs.prepare.outputs.submission_id }}
+          TASK_ID: ${{ needs.prepare.outputs.task_id }}
+          DOWNLOAD_URL: ${{ needs.prepare.outputs.download_url }}
+          VISIBILITY_OVERRIDE: ${{ needs.prepare.outputs.visibility_override }}
+          DISPATCH_STATUS: ${{ needs.prepare.outputs.dispatch_status }}
+          DISPATCH_DETAIL: ${{ needs.prepare.outputs.dispatch_detail }}
+          APP_DOWNLOAD_TOKEN: ${{ secrets.APP_DOWNLOAD_TOKEN }}
+        run: bash scripts/grade.sh
+
+      # The only data this public repo ever hands to another job: the
+      # small, already visibility-filtered result.json, base64'd into a job
+      # output. No actions/upload-artifact anywhere in this workflow — the
+      # raw Playwright report and build/app/runner logs in
+      # .gradework/results never leave this job's VM.
+      - name: Pack result for the report job
+        id: pack
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f .gradework/results/result.json ]; then
+            python3 -c "
+          import json
+          json.dump({
+              'submission_id': '${{ needs.prepare.outputs.submission_id }}',
+              'task_id': '${{ needs.prepare.outputs.task_id }}',
+              'visibility': 'public',
+              'status': 'system_error',
+              'passed': 0,
+              'total': 0,
+              'detail': 'grade.sh produced no result.json (crashed or was killed)',
+          }, open('/tmp/result.json', 'w'))
+          "
+            B64="$(base64 -w0 /tmp/result.json)"
+          else
+            B64="$(base64 -w0 .gradework/results/result.json)"
+          fi
+          echo "result_json_b64=$B64" >> "$GITHUB_OUTPUT"
+
+      - name: Remove decrypted task content
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tasks"
+
+  # Delivers the result to the submitter — the only job with the callback/
+  # signing secrets. It never checks out the submission, builds anything,
+  # decrypts tasks.tar.enc, or runs Docker: its only input from the
+  # untrusted path is the already visibility-filtered result.json passed
+  # as a job output. Runs even if `grade` failed/timed out so a participant
+  # (or the self-test service) always gets a structured answer back.
+  report:
+    needs: [prepare, grade]
+    # always(), not !cancelled(): a cancelled or skipped grade job must
+    # still produce a (system_error) answer, or the submitter waits forever.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Write result.json from the grade job's output
+        run: |
+          set -euo pipefail
+          mkdir -p .gradework/results
+          B64='${{ needs.grade.outputs.result_json_b64 }}'
+          if [ -z "$B64" ]; then
+            python3 -c "
+          import json
+          json.dump({
+              'submission_id': '${{ needs.prepare.outputs.submission_id }}',
+              'task_id': '${{ needs.prepare.outputs.task_id }}',
+              'visibility': 'public',
+              'status': 'system_error',
+              'passed': 0,
+              'total': 0,
+              'detail': 'grade job produced no result (crashed or was killed)',
+          }, open('.gradework/results/result.json', 'w'))
+          "
+          else
+            echo "$B64" | base64 -d > .gradework/results/result.json
+          fi
+
+      - name: Report back
+        env:
+          CALLBACK_URL: ${{ needs.prepare.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ secrets.SELFTEST_CALLBACK_TOKEN }}
+          SELFTEST_DISPATCH_SIGNING_KEY: ${{ secrets.SELFTEST_DISPATCH_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          RESULT_FILE: .gradework/results/result.json
+        run: python3 scripts/report_back.py
