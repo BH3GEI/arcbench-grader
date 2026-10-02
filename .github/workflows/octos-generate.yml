@@ -167,13 +167,12 @@ jobs:
           set -euo pipefail
           test -d genws/template/backend || exit 0
           mkdir -p pkg && cp -r genws/template/frontend genws/template/backend pkg/
-          rm -rf pkg/frontend/node_modules pkg/backend/node_modules
+          # The grader builds with --network=none: ship dist/ and any runtime node_modules as generated.
+          rm -rf pkg/frontend/node_modules
           cat > pkg/Dockerfile <<'DOCKER'
           FROM node:24-bookworm-slim
           WORKDIR /app
           COPY . .
-          RUN cd frontend && npm install --no-audit --no-fund && (npm run build || true)
-          RUN cd backend && npm install --no-audit --no-fund
           ENV PORT=3000
           EXPOSE 3000
           WORKDIR /app/backend
