@@ -28,13 +28,15 @@ run-name: Grade ${{ github.event.client_payload.submission_id || inputs.submissi
 #    ends (post-job VM teardown would do this anyway — the rm is explicit
 #    defense in depth).
 #  - No step echoes task/test file names or contents; no `set -x`.
-#  - The only artifact ever uploaded is the generated app's own build
-#    (visible to the submitter regardless), never anything from
-#    .gradework/results (build/app/runner logs, the raw Playwright report)
-#    which can contain hidden-test detail. The small, already
-#    visibility-filtered result.json is passed `grade` -> `report` as a job
-#    output instead of an artifact, so nothing test-derived is ever
-#    independently browsable on this public repo.
+#  - Only two small things ever leave the `grade` job as artifacts: the
+#    already visibility-filtered result.json (discloses nothing beyond what
+#    the callback already sends the submitter — a hidden task's result.json
+#    has no test/error/screenshot detail at all, see
+#    common/resultshape.py:apply_visibility) and, for public-task failures
+#    only, the handful of screenshot PNGs that result.json already names.
+#    The raw Playwright report and build/app/runner logs under
+#    .gradework/results — which CAN carry hidden-test assertion text — are
+#    never uploaded anywhere.
 #  - Delivery to the submitter is the `report` job's callback POST
 #    (scripts/report_back.py) to the self-test site, never the Actions log.
 
@@ -183,8 +185,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    outputs:
-      result_json_b64: ${{ steps.pack.outputs.result_json_b64 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -224,34 +224,64 @@ jobs:
           APP_DOWNLOAD_TOKEN: ${{ secrets.APP_DOWNLOAD_TOKEN }}
         run: bash scripts/grade.sh
 
-      # The only data this public repo ever hands to another job: the
-      # small, already visibility-filtered result.json, base64'd into a job
-      # output. No actions/upload-artifact anywhere in this workflow — the
-      # raw Playwright report and build/app/runner logs in
-      # .gradework/results never leave this job's VM.
-      - name: Pack result for the report job
-        id: pack
+      # result.json is already visibility-filtered (common/resultshape.py's
+      # apply_visibility strips tests/screenshots/error-text down to just
+      # status/passed/total for a hidden task) — it carries nothing a hidden
+      # task's submitter doesn't already get back over the callback, so
+      # publishing it as a small, 1-day artifact is no bigger a disclosure
+      # than the callback itself. The website's cron reconciler
+      # (fetchGraderResult) depends on being able to read this artifact back
+      # when a callback POST never lands.
+      - name: Upload result.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ needs.prepare.outputs.submission_id }}
+          path: .gradework/results/result.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+      # Screenshots are only ever attached to tests on a *public* task (see
+      # common/resultshape.py: a hidden task's result has no `tests` field
+      # at all, so the website's screenshotPaths() never asks for one) — so
+      # copying out exactly the PNGs result.json already names, and nothing
+      # else from .gradework/results (no raw report.json, no build/app/
+      # runner logs), discloses nothing beyond what the result itself
+      # already shows a public-task submitter. This is deliberately NOT the
+      # old "upload the whole results dir" debug artifact: that held the
+      # raw unfiltered Playwright report and container logs, which could
+      # carry hidden-task assertion text — exactly what a public repo must
+      # not expose.
+      - name: Stage only the screenshots result.json references
         if: always()
         run: |
           set -euo pipefail
-          if [ ! -f .gradework/results/result.json ]; then
-            python3 -c "
-          import json
-          json.dump({
-              'submission_id': '${{ needs.prepare.outputs.submission_id }}',
-              'task_id': '${{ needs.prepare.outputs.task_id }}',
-              'visibility': 'public',
-              'status': 'system_error',
-              'passed': 0,
-              'total': 0,
-              'detail': 'grade.sh produced no result.json (crashed or was killed)',
-          }, open('/tmp/result.json', 'w'))
+          mkdir -p .gradework/shots-only
+          python3 -c "
+          import json, pathlib, shutil
+          result_path = pathlib.Path('.gradework/results/result.json')
+          if result_path.is_file():
+              result = json.loads(result_path.read_text())
+              for t in result.get('tests', []):
+                  rel = t.get('screenshot')
+                  if not rel:
+                      continue
+                  src = pathlib.Path('.gradework/results') / rel
+                  if not src.is_file():
+                      continue
+                  dst = pathlib.Path('.gradework/shots-only') / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
           "
-            B64="$(base64 -w0 /tmp/result.json)"
-          else
-            B64="$(base64 -w0 .gradework/results/result.json)"
-          fi
-          echo "result_json_b64=$B64" >> "$GITHUB_OUTPUT"
+
+      - name: Upload screenshots-only debug artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ needs.prepare.outputs.submission_id }}
+          path: .gradework/shots-only
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Remove decrypted task content
         if: always()
@@ -260,9 +290,10 @@ jobs:
   # Delivers the result to the submitter — the only job with the callback/
   # signing secrets. It never checks out the submission, builds anything,
   # decrypts tasks.tar.enc, or runs Docker: its only input from the
-  # untrusted path is the already visibility-filtered result.json passed
-  # as a job output. Runs even if `grade` failed/timed out so a participant
-  # (or the self-test service) always gets a structured answer back.
+  # untrusted path is the already visibility-filtered result.json, already
+  # uploaded as a narrow artifact by the `grade` job. Runs even if `grade`
+  # failed/timed out so a participant (or the self-test service) always
+  # gets a structured answer back.
   report:
     needs: [prepare, grade]
     # always(), not !cancelled(): a cancelled or skipped grade job must
@@ -277,13 +308,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Write result.json from the grade job's output
+      - name: Download result.json
+        id: dl
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: result-${{ needs.prepare.outputs.submission_id }}
+          path: .gradework/results
+
+      # grade.sh / its job can fail before ever producing result.json
+      # (e.g. the runner OOM-killed the whole job) — synthesize one rather
+      # than silently reporting nothing back.
+      - name: Synthesize a fallback result if none was produced
+        if: steps.dl.outcome != 'success'
         run: |
-          set -euo pipefail
           mkdir -p .gradework/results
-          B64='${{ needs.grade.outputs.result_json_b64 }}'
-          if [ -z "$B64" ]; then
-            python3 -c "
+          python3 -c "
           import json
           json.dump({
               'submission_id': '${{ needs.prepare.outputs.submission_id }}',
@@ -295,9 +335,6 @@ jobs:
               'detail': 'grade job produced no result (crashed or was killed)',
           }, open('.gradework/results/result.json', 'w'))
           "
-          else
-            echo "$B64" | base64 -d > .gradework/results/result.json
-          fi
 
       - name: Report back
         env:
