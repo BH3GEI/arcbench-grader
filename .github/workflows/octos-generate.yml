@@ -1,0 +1,189 @@
+name: octos-generate
+
+# Octos (octos-org/octos-arc agent bundle, built from source at $octos_ref) +
+# glm-5.3-flash on arcbench GitHub stage-1, scored by the arcbench runner
+# image. Manual trigger only; one serial run.
+#
+# Isolation rules enforced here:
+#  - The generate job checks out only octos-requirements/stage1 (sparse) and
+#    hard-fails if any test file is found in the agent workspace.
+#  - Tests enter only in the evaluate job, after generation is finished.
+#  - The model key comes only from the ZAI_API_KEY secret; it is written to a
+#    $RUNNER_TEMP env file (never into the repo, artifacts or logs).
+
+on:
+  workflow_dispatch:
+    inputs:
+      octos_ref:
+        required: false
+        type: string
+        default: main
+        description: "octos-org/octos-arc ref to build the agent bundle from"
+
+concurrency:
+  # Grouped by octos_ref too: runs validating different branches proceed in
+  # parallel (GH free tier allows up to 20 concurrent jobs); two runs on the
+  # SAME ref still queue, same as before.
+  group: octos-generate-${{ github.event.inputs.octos_ref || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            octos-requirements/stage1
+
+      - name: Assert no test material is visible to the agent
+        run: |
+          set -euo pipefail
+          if find . -name '*.spec.ts' -o -name 'e2e.ts' -o -name 'helpers.ts' | grep -q .; then
+            echo "TEST MATERIAL PRESENT IN GENERATE JOB - aborting" >&2
+            exit 1
+          fi
+          echo "clean: no test files in checkout"
+
+      - name: Check out octos-arc (${{ github.event.inputs.octos_ref || 'main' }})
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: octos-org/octos-arc
+          ref: ${{ github.event.inputs.octos_ref || 'main' }}
+          path: octos-arc
+
+      - name: Build the agent bundle
+        run: |
+          set -euo pipefail
+          sh octos-arc/arc/pack.sh
+          echo "octos-arc commit: $(git -C octos-arc rev-parse HEAD)"
+          shasum -a 256 octos-arc/octos-arc-bundle.zip
+
+      - name: Assemble runner workspace (no tests anywhere)
+        run: |
+          set -euo pipefail
+          mkdir -p genws/submission genws/template/.arc genws/template/requirements genws/tests
+          (cd genws/submission && unzip -q ../../octos-arc/octos-arc-bundle.zip)
+          cp -r octos-requirements/stage1/. genws/template/requirements/
+          test -f genws/submission/main.py && test -f genws/submission/requirements.txt
+          python3 - <<'EOF'
+          import json
+          spec = {
+              "agent_source": "uploaded_agent",
+              "runtime": "python",
+              "submission_dir": "/workspace/submission",
+              "template_dir": "/workspace/template",
+              "project_dir": "/workspace/template",
+              "tests_dir": "/workspace/tests",
+              "arc_dir": ".arc",
+              "requirement_dir": "requirements",
+              "output_dir": "/workspace/template",
+              "runner_events_path": ".arc/runner-events.jsonl",
+              "traceability_dir": ".arc/traceability",
+              "evaluation_enabled": False,
+              "task": {"category": "web", "requirement_id": "hackathon--github-stage1",
+                       "test_runner": "playwright"},
+          }
+          open("genws/runner-spec.json", "w").write(json.dumps(spec, indent=2) + "\n")
+          open("genws/execution.debug.log", "w").write(
+              "Actions ARC-Bench workspace assembled successfully.\n")
+          EOF
+          if find genws -name '*.spec.ts' -o -name 'e2e.ts' -o -name 'helpers.ts' | grep -q .; then
+            echo "TEST MATERIAL IN RUNNER WORKSPACE - aborting" >&2
+            exit 1
+          fi
+          echo "workspace ready"
+
+      - name: Run Octos generation in the arcbench runner image (2g/1cpu)
+        timeout-minutes: 115
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          ENV_FILE="$RUNNER_TEMP/runner.env"
+          {
+            printf 'OPENAI_API_KEY=%s\n' "$ZAI_API_KEY"
+            printf 'OPENAI_BASE_URL=%s\n' "https://api.z.ai/api/coding/paas/v4"
+            printf 'MODEL=%s\n' "glm-5.3-flash"
+          } > "$ENV_FILE"
+          chmod 600 "$ENV_FILE"
+          gen_rc=0
+          docker run --rm --init \
+            --name arcbench-gen \
+            --mount "type=bind,source=$PWD/genws,target=/workspace" \
+            --user "$(id -u):$(id -g)" \
+            --memory 2g --cpus 1 \
+            --env-file "$ENV_FILE" \
+            --env ARC_DEBUG=1 \
+            --env HOME=/tmp/arcbench-home \
+            --env PIP_TARGET=/tmp/arcbench-agent-deps \
+            --env PYTHONPATH=/tmp/arcbench-agent-deps \
+            --env npm_config_cache=/tmp/arcbench-npm-cache \
+            gyataro/arcbench-runner:local-base \
+            python3 /opt/arcbench/run_submission.py 2>&1 | tee gen-console.log || gen_rc=$?
+          rm -f "$ENV_FILE"
+          echo "generation runner exit code: $gen_rc"
+          tail -5 genws/template/.arc/run-summary.json 2>/dev/null || true
+          # The runner's own exit code used to be swallowed by `|| true`, so a
+          # pipeline-DOT parse error or a "no app produced" run still showed
+          # green. Call it what it is: no frontend/ + backend/ means nothing
+          # was generated, whatever the exit code says.
+          if [ ! -d genws/template/frontend ] || [ ! -d genws/template/backend ]; then
+            reason="generation produced no usable app (missing frontend/ or backend/ under genws/template); runner exit code $gen_rc"
+            # gen-console.log is the host-side tee of run_submission.py's own
+            # stdout, which a long run can leave block-buffered and near-empty;
+            # genws/execution.debug.log is the runner's own file log and has
+            # reliably carried these lines in practice, so check both.
+            if grep -q "failed to parse pipeline DOT" gen-console.log genws/execution.debug.log 2>/dev/null; then
+              reason="$reason — pipeline .dot failed to parse"
+            elif grep -q "^\[runner\] Runner failed:" gen-console.log genws/execution.debug.log 2>/dev/null; then
+              reason="$reason — $(grep -h '^\[runner\] Runner failed:' gen-console.log genws/execution.debug.log 2>/dev/null | tail -1)"
+            fi
+            echo "::error::octos-stage1 generate r${{ matrix.replica }}: $reason"
+            { echo "## octos-stage1 generate r${{ matrix.replica }}: GENERATION FAILED"; echo; echo "$reason"; } \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$gen_rc" -ne 0 ]; then
+            echo "::warning::octos-stage1 generate r${{ matrix.replica }}: runner exited $gen_rc but frontend/backend exist; treating as a degraded (not infra-failed) run"
+          fi
+
+      - name: Package the app as a self-test zip (Dockerfile at root)
+        if: always()
+        run: |
+          set -euo pipefail
+          test -d genws/template/backend || exit 0
+          mkdir -p pkg && cp -r genws/template/frontend genws/template/backend pkg/
+          rm -rf pkg/frontend/node_modules pkg/backend/node_modules
+          cat > pkg/Dockerfile <<'DOCKER'
+          FROM node:24-bookworm-slim
+          WORKDIR /app
+          COPY . .
+          RUN cd frontend && npm install --no-audit --no-fund && (npm run build || true)
+          RUN cd backend && npm install --no-audit --no-fund
+          ENV PORT=3000
+          EXPOSE 3000
+          WORKDIR /app/backend
+          CMD ["npm", "start"]
+          DOCKER
+          sed -i 's/^          //' pkg/Dockerfile
+          (cd pkg && zip -qr -X ../selftest-app-r${{ matrix.replica }}.zip .)
+          ls -la selftest-app-r${{ matrix.replica }}.zip
+
+      - name: Upload self-test zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-app-r${{ matrix.replica }}
+          path: selftest-app-r${{ matrix.replica }}.zip
+          if-no-files-found: ignore
+          retention-days: 14
