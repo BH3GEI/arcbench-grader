@@ -1,0 +1,124 @@
+name: codex-generate
+
+# OpenAI Codex CLI (built from the official github.com/openai/codex source) +
+# glm-5.3-flash (Z.ai) on arcbench GitHub stage-1. Same requirements input and
+# packaging as octos-generate. The agent sees only octos-requirements/stage1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_ref:
+        required: false
+        type: string
+        default: rust-v0.93.0
+      model:
+        required: false
+        type: string
+        default: glm-5.3-flash
+      minutes:
+        required: false
+        type: string
+        default: "80"
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            octos-requirements/stage1
+            codex
+
+      - name: Assert no test material is visible to the agent
+        run: |
+          set -euo pipefail
+          if find . -name '*.spec.ts' -o -name 'e2e.ts' -o -name 'helpers.ts' -o -name 'tasks.tar.enc' | grep -q .; then
+            echo "TEST MATERIAL PRESENT - aborting" >&2; exit 1
+          fi
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost 2>/dev/null || true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache codex build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: codex-bin
+          key: codex-bin-${{ inputs.codex_ref || 'rust-v0.93.0' }}-${{ runner.os }}-${{ hashFiles('codex/patches/*.patch') }}
+
+      - name: Build codex from official source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.codex_ref || 'rust-v0.93.0' }}" https://github.com/openai/codex codex-src
+          cd codex-src
+          for p in ../codex/patches/*.patch; do git apply "$p"; done
+          echo "codex commit: $(git rev-parse HEAD)"
+          cd codex-rs
+          cargo build --release -p codex-cli --bin codex
+          mkdir -p ../../codex-bin && cp target/release/codex ../../codex-bin/
+
+      - name: Assemble workspace (requirements only)
+        run: |
+          set -euo pipefail
+          ./codex-bin/codex --version
+          mkdir -p work/requirements work/frontend work/backend
+          cp -r octos-requirements/stage1/. work/requirements/
+          mkdir -p codex-home
+          printf '%s\n' \
+            'model = "${{ inputs.model || 'glm-5.3-flash' }}"' \
+            'model_provider = "zai"' \
+            '' \
+            '[model_providers.zai]' \
+            'name = "Z.ai"' \
+            'base_url = "https://api.z.ai/api/coding/paas/v4"' \
+            'env_key = "ZAI_API_KEY"' \
+            'wire_api = "chat"' > codex-home/config.toml
+          find work -type f | sort
+
+      - name: Run codex
+        working-directory: work
+        timeout-minutes: 100
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          CODEX_HOME: ${{ github.workspace }}/codex-home
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          timeout --signal=TERM --kill-after=20s $(( ${{ inputs.minutes || 80 }} * 60 )) \
+            ../codex-bin/codex exec --skip-git-repo-check -s workspace-write -C "$PWD" \
+            "$(cat ../codex/prompt.txt)" > ../codex-exec.log 2>&1
+          rc=$?
+          echo "codex exit: $rc, elapsed: $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -40 ../codex-exec.log
+          find frontend backend -type f | head -50
+
+      - name: Package self-test zip
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f work/backend/server.js || { echo "::error::no backend/server.js"; exit 1; }
+          mkdir -p pkg && cp -r work/frontend work/backend pkg/
+          printf '%s\n' 'FROM node:24-bookworm-slim' 'WORKDIR /app' 'COPY . .' 'ENV PORT=3000' 'EXPOSE 3000' 'WORKDIR /app/backend' 'CMD ["node","server.js"]' > pkg/Dockerfile
+          (cd pkg && zip -qr -X ../codex-app-r${{ matrix.replica }}.zip .)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codex-app-r${{ matrix.replica }}
+          path: |
+            codex-app-r${{ matrix.replica }}.zip
+            codex-exec.log
+          if-no-files-found: ignore
+          retention-days: 14
