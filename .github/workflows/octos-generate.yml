@@ -116,13 +116,17 @@ jobs:
         timeout-minutes: 320
         env:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          GEN_MODEL: ${{ github.event.inputs.model || 'glm-5.3-flash' }}
         run: |
           set -euo pipefail
           ENV_FILE="$RUNNER_TEMP/runner.env"
           {
-            printf 'OPENAI_API_KEY=%s\n' "$ZAI_API_KEY"
-            printf 'OPENAI_BASE_URL=%s\n' "https://api.z.ai/api/coding/paas/v4"
-            printf 'MODEL=%s\n' "${{ github.event.inputs.model || 'glm-5.3-flash' }}"
+            case "$GEN_MODEL" in
+              kimi*) printf 'OPENAI_API_KEY=%s\nOPENAI_BASE_URL=%s\n' "$KIMI_API_KEY" "https://api.kimi.com/coding/v1" ;;
+              *)     printf 'OPENAI_API_KEY=%s\nOPENAI_BASE_URL=%s\n' "$ZAI_API_KEY" "https://api.z.ai/api/coding/paas/v4" ;;
+            esac
+            printf 'MODEL=%s\n' "$GEN_MODEL"
           } > "$ENV_FILE"
           chmod 600 "$ENV_FILE"
           gen_rc=0
